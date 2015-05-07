@@ -60,7 +60,7 @@ class SQLiteThread(threading.Thread):
         self.mBox.logger.info(" === ending sqlite thread === ")
 
 
-    def onUnload(self):
+    def onExit(self):
         self.mUnloading = True
         self.mQuery = ""
         self.mSem1.release()
@@ -77,21 +77,56 @@ class MyClass(GeneratedClass):
         GeneratedClass.__init__(self)
 
     def onLoad(self):
-        self.sqlThread = None
-        self.framemanager = ALProxy("ALFrameManager")
-        dbfile = self.framemanager.getBehaviorPath(self.behaviorId) + self.getParameter("sqlite db file")
-        self.sqlThread = SQLiteThread(dbfile,self)
-        self.sqlThread.start()
+        global TKSQliteThreads
+
+        self.sqliteGlobalLock = None
+
+        if "TKSQliteThreads" in globals():
+            self.sqliteGlobalLock = TKSQliteThreads[0]["lock"]
+        else:
+            self.sqliteGlobalLock = threading.Lock()
+            TKSQliteThreads = [{"file":"global", "thread":None, "lock":self.sqliteGlobalLock, "count":0}]
+
+        with self.sqliteGlobalLock:
+            self.framemanager = ALProxy("ALFrameManager")
+
+            self.dbfile = self.getParameter("sqlite db file")
+            self.dbfilepath = self.framemanager.getBehaviorPath(self.behaviorId) + self.dbfile
+
+            self.sqlThread = None
+            for t in TKSQliteThreads:
+                if t["file"] == self.dbfilepath:
+                    self.sqlThread = t["thread"]
+                    self.dbLock = t["lock"]
+                    count = t["count"] + 1
+                    t["count"] = count
+                    self.logger.info("SQLite query <OPEN> FILE:%s REF=%d" % (self.dbfile,count))
+                    break
+
+            if self.sqlThread == None:
+                self.logger.info("SQLite query <OPEN> FILE:%s REF=1" % self.dbfile)
+                self.sqlThread = SQLiteThread(self.dbfilepath,self)
+                self.dbLock = threading.Lock()
+
+                TKSQliteThreads.append({"file":self.dbfilepath, "thread":self.sqlThread, "lock":self.dbLock, "count":1})
+                self.sqlThread.start()
 
     def onUnload(self):
         if self.sqlThread:
-            t = self.sqlThread
-            self.sqlThread = None
-            t.onUnload()
+            with self.sqliteGlobalLock:
+                for t in TKSQliteThreads:
+                    if t["file"] == self.dbfilepath:
+                        t["count"] = t["count"] - 1
+                        self.logger.info("SQLite query <CLOSE> FILE:%s REF=%d" % (self.dbfile,t["count"]))
+                        if t["count"] <= 0:
+                            TKSQliteThreads.remove(t)
+                            self.sqlThread.onExit()
+                        break
 
     def onInput_onStart(self, p):
         if self.sqlThread:
-            return self.onResult(self.sqlThread.onExecuteQuery(p))
+            with self.dbLock:
+                return self.onResult(self.sqlThread.onExecuteQuery(p))
 
         else:
             return self.onResult([])
